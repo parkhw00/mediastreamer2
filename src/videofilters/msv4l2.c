@@ -405,6 +405,7 @@ static int set_camera_feature(V4l2State *s, unsigned int ctl_id, int value, cons
 }
 
 
+// from https://github.com/GStreamer/gst-plugins-bad/tree/master/sys/uvch264
 /* UVC H.264 control selectors */
 
 typedef enum _uvcx_control_selector_t
@@ -469,6 +470,7 @@ int xu_query (int v4l2_fd, unsigned int selector, unsigned int query, void * dat
 	struct uvc_xu_control_query xu;
 	unsigned short len;
 
+	// FIXME: unit id for "HD Pro Webcam C920"
 	xu.unit = 12;//self->h264_unit_id;
 	xu.selector = selector;
 
