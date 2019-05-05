@@ -902,6 +902,7 @@ void setup_media_streams(MediastreamDatas* args) {
 		}
 		ms_message("Starting video stream.\n");
 		args->video=video_stream_new(factory, args->localport, args->localport+1, ms_is_ipv6(args->ip));
+video_stream_set_direction (args->video, MediaStreamSendOnly);
 		if (args->video_display_filter)
 			video_stream_set_display_filter_name(args->video, args->video_display_filter);
 
@@ -950,7 +951,7 @@ void setup_media_streams(MediastreamDatas* args) {
 					);
 		args->session=args->video->ms.sessions.rtp_session;
 
-		ms_filter_call_method(args->video->output,MS_VIDEO_DISPLAY_ZOOM, zoom);
+		//ms_filter_call_method(args->video->output,MS_VIDEO_DISPLAY_ZOOM, zoom);
 		if (args->enable_srtp) {
 			ms_message("SRTP enabled: %d",
 				video_stream_enable_strp(

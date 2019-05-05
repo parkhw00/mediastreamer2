@@ -92,6 +92,9 @@ typedef struct V4l2State{
 	int queued;
 	bool_t configured;
 	Rfc3984Context *packer;
+
+int es_dump;
+int es_dump0;
 }V4l2State;
 
 static int msv4l2_open(V4l2State *s){
@@ -780,6 +783,10 @@ static mblk_t *v4l2_dequeue_ready_buffer(V4l2State *s, int poll_timeout_ms){
 			if (s->picture_size!=0)
 				ret->b_cont->b_wptr=ret->b_cont->b_rptr+s->picture_size;
 			else ret->b_cont->b_wptr=ret->b_cont->b_rptr+buf.bytesused;
+
+//ms_message ("v4l2: de-queue index %d, %d bytes", buf.index, ret->b_cont->b_wptr - ret->b_cont->b_rptr);
+			if (s->es_dump0 >= 0)
+				write (s->es_dump0, ret->b_cont->b_rptr, ret->b_cont->b_wptr - ret->b_cont->b_rptr);
 		}
 	}
 	return ret;
@@ -855,6 +862,17 @@ static void msv4l2_init(MSFilter *f){
 	rfc3984_enable_stap_a(s->packer, FALSE);
 	f->data=s;
 	qinit(&s->rq);
+
+	{
+		char *t;
+		s->es_dump = -1;
+		if ((t = getenv("MS2_CAM_ES_DUMP")) != NULL)
+			s->es_dump = open (t, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+
+		s->es_dump0 = -1;
+		if ((t = getenv("MS2_CAM_ES_DUMP0")) != NULL)
+			s->es_dump0 = open (t, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	}
 }
 
 static void msv4l2_uninit(MSFilter *f){
@@ -895,7 +913,81 @@ static void *msv4l2_thread(void *ptr){
 		if (s->fd!=-1){
 			mblk_t *m;
 			m=v4lv2_grab_image(s,200);
-			if (m){
+			if (m!=NULL && s->pix_fmt == MS_H264)
+			{
+				uint32_t timestamp = 0;
+				MSQueue nals;
+				ms_queue_init(&nals);
+
+				if (s->es_dump >= 0)
+					write (s->es_dump, m->b_cont->b_rptr, m->b_cont->b_wptr - m->b_cont->b_rptr);
+
+				//timestamp=f->ticker->time*90;
+				//while (0)
+				{
+					unsigned char *p, *prev;
+					int zeros;
+					bool_t got_start;
+					int offs;
+
+					got_start = FALSE;
+					zeros = 0;
+					offs = 0;
+					prev = NULL;
+					for (p = m->b_cont->b_rptr; p < m->b_cont->b_wptr; p++)
+					{
+						if (got_start)
+						{
+							unsigned char *t = p - 3;
+							ms_message ("%02x %02x %02x %02x %02x %02x %02x nal type %2d at %d",
+									t[0], t[1], t[2], t[3], t[4], t[5], t[6],
+									*p & 0x1f, offs);
+
+							if (prev)
+							{
+								int size = p - prev - zeros;
+								mblk_t *tm;
+								tm = allocb (size, 0);
+								memcpy (tm->b_wptr, prev, size);
+								tm->b_wptr += size;
+								ms_queue_put (&nals, tm);
+							}
+							prev = p;
+
+							got_start = FALSE;
+							zeros = 0;
+						}
+						else
+						{
+							if (*p == 0)
+								zeros ++;
+							else if (zeros >= 2 && *p == 0x01)
+								got_start = TRUE;
+							else
+								zeros = 0;
+						}
+
+						offs ++;
+					}
+
+					if (prev)
+					{
+						int size = p - prev - zeros;
+						mblk_t *tm;
+						tm = allocb (size, 0);
+						memcpy (tm->b_wptr, prev, size);
+						tm->b_wptr += size;
+						ms_queue_put (&nals, tm);
+					}
+				}
+				ms_mutex_lock(&s->mutex);
+				rfc3984_pack (s->packer, &nals, &s->rq, timestamp);
+				ms_mutex_unlock(&s->mutex);
+
+				//freemsg (m);
+				m = NULL;
+			}
+			else if (m){
 				mblk_t *om=dupmsg(m);
 				mblk_set_marker_info(om,(s->pix_fmt==MS_MJPEG));
 				ms_mutex_lock(&s->mutex);
@@ -943,7 +1035,8 @@ static void msv4l2_process(MSFilter *f){
 	elapsed=((float)(curtime-s->start_time))/1000.0;
 	cur_frame=elapsed*s->fps;
 
-	if (cur_frame>=s->th_frame_count){
+	//if (cur_frame>=s->th_frame_count){
+	while (1) {
 		mblk_t *om=NULL;
 		ms_mutex_lock(&s->mutex);
 		if (s->fd!=-1){
@@ -962,11 +1055,14 @@ static void msv4l2_process(MSFilter *f){
 			}
 		}
 		ms_mutex_unlock(&s->mutex);
+#if 0
 		if (om!=NULL && s->pix_fmt == MS_H264)
 		{
-			mblk_t *m;
 			MSQueue nals;
 			ms_queue_init(&nals);
+
+			if (s->es_dump >= 0)
+				write (s->es_dump, om->b_cont->b_rptr, om->b_cont->b_wptr - om->b_cont->b_rptr);
 
 			timestamp=f->ticker->time*90;
 			//while (0)
@@ -992,10 +1088,11 @@ static void msv4l2_process(MSFilter *f){
 						if (prev)
 						{
 							int size = p - prev - zeros;
-							m = allocb (size, 0);
-							memcpy (m->b_wptr, prev, size);
-							m->b_wptr += size;
-							ms_queue_put (&nals, m);
+							mblk_t *tm;
+							tm = allocb (size, 0);
+							memcpy (tm->b_wptr, prev, size);
+							tm->b_wptr += size;
+							ms_queue_put (&nals, tm);
 						}
 						prev = p;
 
@@ -1018,10 +1115,11 @@ static void msv4l2_process(MSFilter *f){
 				if (prev)
 				{
 					int size = p - prev - zeros;
-					m = allocb (size, 0);
-					memcpy (m->b_wptr, prev, size);
-					m->b_wptr += size;
-					ms_queue_put (&nals, m);
+					mblk_t *tm;
+					tm = allocb (size, 0);
+					memcpy (tm->b_wptr, prev, size);
+					tm->b_wptr += size;
+					ms_queue_put (&nals, tm);
 				}
 			}
 			rfc3984_pack (s->packer, &nals, f->outputs[0], timestamp);
@@ -1029,6 +1127,7 @@ static void msv4l2_process(MSFilter *f){
 			freemsg (om);
 			om = NULL;
 		}
+#endif
 		if (om!=NULL){
 			timestamp=f->ticker->time*90;/* rtp uses a 90000 Hz clockrate for video*/
 			mblk_set_timestamp_info(om,timestamp);
@@ -1036,6 +1135,7 @@ static void msv4l2_process(MSFilter *f){
 			ms_queue_put(f->outputs[0],om);
 			ms_average_fps_update(&s->avgfps,f->ticker->time);
 		}
+else break;
 		s->th_frame_count++;
 	}
 }
@@ -1177,7 +1277,7 @@ static bool_t msv4l2_encode_to_mime_type (MSWebCam *obj, const char *mime_type)
 		return FALSE;
 
 	env = getenv ("MS2_V4L2_NO_ENCODE");
-	if (env && !strcmp (env, mime_type))
+	if (env)
 		return FALSE;
 
 	fd = open (obj->name, O_RDWR);
