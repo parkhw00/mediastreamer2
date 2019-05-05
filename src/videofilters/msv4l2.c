@@ -579,6 +579,7 @@ int set_probe (int fd)
 static int msv4l2_configure(V4l2State *s){
 	struct v4l2_capability cap;
 	struct v4l2_format fmt;
+	struct v4l2_streamparm streamparam;
 	MSVideoSize vsize;
 	const char *focus;
 
@@ -647,6 +648,24 @@ set_probe (s->fd);
 		s->vsize.height=fmt.fmt.pix.height;
 	}
 	s->picture_size=get_picture_buffer_size(s->pix_fmt,s->vsize.width,s->vsize.height);
+
+	memset (&streamparam, 0, sizeof (streamparam));
+	streamparam.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (v4l2_ioctl (s->fd, VIDIOC_G_PARM, &streamparam) < 0) {
+		ms_error ("VIDIOC_G_PARM failed: %s", strerror (errno));
+	}
+	else {
+		if (streamparam.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)
+		{
+			streamparam.parm.capture.timeperframe.numerator = 1;
+			streamparam.parm.capture.timeperframe.denominator = s->fps;
+			if (v4l2_ioctl (s->fd, VIDIOC_S_PARM, &streamparam) < 0) {
+				ms_error ("VIDIOC_S_PARM failed: %s", strerror (errno));
+			}
+		}
+		else
+			ms_error ("no TIMEPERFRAME capability");
+	}
 
 	focus=getenv("MS2_CAM_FOCUS");
 	if (focus){
@@ -853,7 +872,7 @@ static void msv4l2_init(MSFilter *f){
 	V4l2State *s=ms_new0(V4l2State,1);
 	s->dev=ms_strdup("/dev/video0");
 	s->fd=-1;
-	s->vsize=MS_VIDEO_SIZE_CIF;
+	s->vsize=MS_VIDEO_SIZE_720P;
 	s->fps=15;
 	s->configured=FALSE;
 	s->pix_fmt = MS_PIX_FMT_UNKNOWN;
@@ -1158,6 +1177,7 @@ static void msv4l2_postprocess(MSFilter *f){
 static int msv4l2_set_fps(MSFilter *f, void *arg){
 	V4l2State *s=(V4l2State*)f->data;
 	s->fps=*(float*)arg;
+	ms_message ("V4L2: set fps. %f", s->fps);
 	return 0;
 }
 
@@ -1226,6 +1246,12 @@ static int msv4l2_get_fps(MSFilter *f, void *arg){
 	return 0;
 }
 
+static int msv4l2_enc_notify_pli(MSFilter *f, void *arg){
+	V4l2State *s=(V4l2State*)f->data;
+	ms_message("v4l2: PLI requested");
+	return 0;
+}
+
 static MSFilterMethod msv4l2_methods[]={
 	{	MS_FILTER_SET_FPS	,	msv4l2_set_fps	},
 	{	MS_FILTER_SET_VIDEO_SIZE,	msv4l2_set_vsize	},
@@ -1233,6 +1259,7 @@ static MSFilterMethod msv4l2_methods[]={
 	{	MS_FILTER_SET_PIX_FMT	,	msv4l2_set_pixfmt	},
 	{	MS_FILTER_GET_PIX_FMT	,	msv4l2_get_pixfmt	},
 	{	MS_FILTER_GET_FPS	,	msv4l2_get_fps	},
+	{	MS_VIDEO_ENCODER_NOTIFY_PLI,	msv4l2_enc_notify_pli	},
 	{	0			,	NULL		}
 };
 
