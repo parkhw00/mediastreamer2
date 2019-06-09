@@ -23,7 +23,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #ifdef HAVE_LINUX_VIDEODEV2_H
 
-#define POSSIBLE_FORMATS_COUNT 4
+#define POSSIBLE_FORMATS_COUNT 5
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -36,10 +36,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <poll.h>
 
 #include <linux/videodev2.h>
+#include <linux/uvcvideo.h>
+#include <linux/usb/video.h>
 
 #include "mediastreamer2/msvideo.h"
 #include "mediastreamer2/msticker.h"
 #include "mediastreamer2/mswebcam.h"
+#include "mediastreamer2/rfc3984.h"
 
 #ifdef HAVE_LIBV4L2
 #include <libv4l2.h>
@@ -90,9 +93,13 @@ typedef struct V4l2State{
 	MSYuvBufAllocator* buf_allocator;
 	int rotation;
 	bool_t use_rotation;
+	Rfc3984Context *packer;
+	MSVideoConfiguration vconf;
+	const MSVideoConfiguration *vconf_list;
 }V4l2State;
 
 static int msv4l2_open(V4l2State *s){
+	ms_message("%s.%d open video", __func__, __LINE__);
 	int fd=v4l2_open(s->dev,O_RDWR|O_NONBLOCK);
 	if (fd==-1){
 		ms_error("Could not open %s: %s",s->dev,strerror(errno));
@@ -103,6 +110,7 @@ static int msv4l2_open(V4l2State *s){
 }
 
 static int msv4l2_close(V4l2State *s){
+	ms_message("%s.%d close video", __func__, __LINE__);
 	if (s->fd!=-1){
 		v4l2_close(s->fd);
 		s->fd=-1;
@@ -197,18 +205,45 @@ static MSPixFmt v4l2_format_to_ms(int v4l2format) {
 			return MS_MJPEG;
 		case V4L2_PIX_FMT_RGB24:
 			return MS_RGB24;
+		case V4L2_PIX_FMT_H264:
+			return MS_H264;
 		default:
 			ms_error("Unknown v4l2 format 0x%08x", v4l2format);
 			return MS_PIX_FMT_UNKNOWN;
 	}
 }
 
-static const V4L2FormatDescription* query_format_description_for_size(int fd, MSVideoSize vsize, bool_t use_rotation) {
+static int ms_format_to_v4l2(MSPixFmt msformat) {
+	switch (msformat) {
+		case MS_YUV420P:
+			return V4L2_PIX_FMT_YUV420;
+		case MS_YUYV:
+			return V4L2_PIX_FMT_YUYV;
+		case MS_MJPEG:
+			return V4L2_PIX_FMT_MJPEG;
+		case MS_RGB24:
+			return V4L2_PIX_FMT_RGB24;
+		case MS_H264:
+			return V4L2_PIX_FMT_H264;
+		default:
+			ms_error("Unknown ms format %d", msformat);
+			return 0;
+	}
+}
+
+static const V4L2FormatDescription* query_format_description_for_size(int fd, MSVideoSize vsize, MSPixFmt pix_fmt, bool_t use_rotation) {
 	/* hardcode supported format in preferred order*/
 	static V4L2FormatDescription formats[POSSIBLE_FORMATS_COUNT];
 	int i=0;
 
 	memset(formats,0,sizeof(formats));
+
+	if (pix_fmt != MS_PIX_FMT_UNKNOWN)
+	{
+		formats[i].pixel_format = ms_format_to_v4l2 (pix_fmt);
+		formats[i].max_fps = -1;
+		i++;
+	}
 
 	formats[i].pixel_format = V4L2_PIX_FMT_YUV420;
 	formats[i].max_fps = -1;
@@ -304,7 +339,7 @@ MSPixFmt msv4l2_pick_best_format_x86(int fd, const V4L2FormatDescription* format
 
 				if (v4lv2_try_format(fd, &fmt, format_desc[j].pixel_format)) {
 					MSPixFmt selected=v4l2_format_to_ms(format_desc[j].pixel_format);
-					ms_message("V4L2: selected format is %s", ms_pix_fmt_to_string(selected));
+					ms_message("V4L2: selected format is %s, %dx%d", ms_pix_fmt_to_string(selected), vsize.width, vsize.height);
 					return selected;
 				}
 			}
@@ -380,6 +415,172 @@ static int set_camera_feature(V4l2State *s, unsigned int ctl_id, int value, cons
 }
 
 
+/* UVC H.264 control selectors */
+
+typedef enum _uvcx_control_selector_t
+{
+	UVCX_VIDEO_CONFIG_PROBE			= 0x01,
+	UVCX_VIDEO_CONFIG_COMMIT		= 0x02,
+	UVCX_RATE_CONTROL_MODE			= 0x03,
+	UVCX_TEMPORAL_SCALE_MODE		= 0x04,
+	UVCX_SPATIAL_SCALE_MODE			= 0x05,
+	UVCX_SNR_SCALE_MODE			= 0x06,
+	UVCX_LTR_BUFFER_SIZE_CONTROL		= 0x07,
+	UVCX_LTR_PICTURE_CONTROL		= 0x08,
+	UVCX_PICTURE_TYPE_CONTROL		= 0x09,
+	UVCX_VERSION				= 0x0A,
+	UVCX_ENCODER_RESET			= 0x0B,
+	UVCX_FRAMERATE_CONFIG			= 0x0C,
+	UVCX_VIDEO_ADVANCE_CONFIG		= 0x0D,
+	UVCX_BITRATE_LAYERS			= 0x0E,
+	UVCX_QP_STEPS_LAYERS			= 0x0F,
+} uvcx_control_selector_t;
+
+typedef unsigned int   guint32;
+typedef unsigned short guint16;
+typedef unsigned char  guint8;
+
+typedef struct _uvcx_video_config_probe_commit_t
+{
+	guint32	dwFrameInterval;
+	guint32	dwBitRate;
+	guint16	bmHints;
+	guint16	wConfigurationIndex;
+	guint16	wWidth;
+	guint16	wHeight;
+	guint16	wSliceUnits;
+	guint16	wSliceMode;
+	guint16	wProfile;
+	guint16	wIFramePeriod;
+	guint16	wEstimatedVideoDelay;
+	guint16	wEstimatedMaxConfigDelay;
+	guint8	bUsageType;
+	guint8	bRateControlMode;
+	guint8	bTemporalScaleMode;
+	guint8	bSpatialScaleMode;
+	guint8	bSNRScaleMode;
+	guint8	bStreamMuxOption;
+	guint8	bStreamFormat;
+	guint8	bEntropyCABAC;
+	guint8	bTimestamp;
+	guint8	bNumOfReorderFrames;
+	guint8	bPreviewFlipped;
+	guint8	bView;
+	guint8	bReserved1;
+	guint8	bReserved2;
+	guint8	bStreamID;
+	guint8	bSpatialLayerRatio;
+	guint16	wLeakyBucketSize;
+} __attribute__((packed)) uvcx_video_config_probe_commit_t;
+
+#define UVC_GET_LEN					0x85
+int xu_query (int v4l2_fd, unsigned int selector, unsigned int query, void * data)
+{
+	struct uvc_xu_control_query xu;
+	unsigned short len;
+
+	xu.unit = 12;//self->h264_unit_id;
+	xu.selector = selector;
+
+	xu.query = UVC_GET_LEN;
+	xu.size = sizeof (len);
+	xu.data = (unsigned char *) &len;
+	if (-1 == ioctl (v4l2_fd, UVCIOC_CTRL_QUERY, &xu)) {
+		ms_error ("PROBE GET_LEN error\n");
+		return -1;
+	}
+
+	if (query == UVC_GET_LEN) {
+		*((unsigned short *) data) = len;
+	} else {
+		xu.query = query;
+		xu.size = len;
+		xu.data = data;
+		if (-1 == ioctl (v4l2_fd, UVCIOC_CTRL_QUERY, &xu)) {
+			ms_error ("query %u failed\n", query);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static void
+print_probe_commit (uvcx_video_config_probe_commit_t * probe)
+{
+	ms_message ("  Frame interval : %d *100ns",
+			probe->dwFrameInterval);
+	ms_message ("  Bit rate : %d", probe->dwBitRate);
+	ms_message ("  Hints : %X", probe->bmHints);
+	ms_message ("  Configuration index : %d",
+			probe->wConfigurationIndex);
+	ms_message ("  Width : %d", probe->wWidth);
+	ms_message ("  Height : %d", probe->wHeight);
+	ms_message ("  Slice units : %d", probe->wSliceUnits);
+	ms_message ("  Slice mode : %X", probe->wSliceMode);
+	ms_message ("  Profile : %X", probe->wProfile);
+	ms_message ("  IFrame Period : %d ms", probe->wIFramePeriod);
+	ms_message ("  Estimated video delay : %d ms",
+			probe->wEstimatedVideoDelay);
+	ms_message ("  Estimated max config delay : %d ms",
+			probe->wEstimatedMaxConfigDelay);
+	ms_message ("  Usage type : %X", probe->bUsageType);
+	ms_message ("  Rate control mode : %X", probe->bRateControlMode);
+	ms_message ("  Temporal scale mode : %X",
+			probe->bTemporalScaleMode);
+	ms_message ("  Spatial scale mode : %X",
+			probe->bSpatialScaleMode);
+	ms_message ("  SNR scale mode : %X", probe->bSNRScaleMode);
+	ms_message ("  Stream mux option : %X", probe->bStreamMuxOption);
+	ms_message ("  Stream Format : %X", probe->bStreamFormat);
+	ms_message ("  Entropy CABAC : %X", probe->bEntropyCABAC);
+	ms_message ("  Timestamp : %X", probe->bTimestamp);
+	ms_message ("  Num of reorder frames : %d",
+			probe->bNumOfReorderFrames);
+	ms_message ("  Preview flipped : %X", probe->bPreviewFlipped);
+	ms_message ("  View : %d", probe->bView);
+	ms_message ("  Stream ID : %X", probe->bStreamID);
+	ms_message ("  Spatial layer ratio : %f",
+			((probe->bSpatialLayerRatio & 0xF0) >> 4) +
+			((float) (probe->bSpatialLayerRatio & 0x0F)) / 16);
+	ms_message ("  Leaky bucket size : %d ms",
+			probe->wLeakyBucketSize);
+}
+
+int set_probe (int fd)
+{
+	uvcx_video_config_probe_commit_t probe = { };
+
+	if (xu_query (fd, UVCX_VIDEO_CONFIG_PROBE, UVC_GET_CUR, & probe) < 0) {
+		ms_error ("PROBE GET_CUR error\n");
+		return -1;
+	}
+
+	print_probe_commit (&probe);
+	//probe.wWidth = 1280;
+	//probe.wHeight = 720;
+	probe.wIFramePeriod = 1000;
+
+	if (xu_query (fd, UVCX_VIDEO_CONFIG_PROBE, UVC_SET_CUR, & probe) < 0) {
+		ms_error ("PROBE GET_CUR error\n");
+		return -1;
+	}
+
+	if (xu_query (fd, UVCX_VIDEO_CONFIG_PROBE, UVC_GET_CUR, & probe) < 0) {
+		ms_error ("PROBE GET_CUR error\n");
+		return -1;
+	}
+
+	print_probe_commit (&probe);
+
+	if (xu_query (fd, UVCX_VIDEO_CONFIG_COMMIT, UVC_SET_CUR, & probe) < 0) {
+		ms_error ("PROBE GET_CUR error\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 static int msv4l2_configure(V4l2State *s){
 	struct v4l2_capability cap;
 	struct v4l2_format fmt;
@@ -404,6 +605,8 @@ static int msv4l2_configure(V4l2State *s){
 
 	ms_message("Driver is %s, version is %i", cap.driver, cap.version);
 
+set_probe (s->fd);
+
 	memset(&fmt,0,sizeof(fmt));
 
 	fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -413,7 +616,7 @@ static int msv4l2_configure(V4l2State *s){
 	vsize=s->requested_vsize;
 
 	do{
-		const V4L2FormatDescription* formats_desc = query_format_description_for_size(s->fd, s->requested_vsize, s->use_rotation);
+		const V4L2FormatDescription* formats_desc = query_format_description_for_size(s->fd, s->requested_vsize, s->pix_fmt, s->use_rotation);
 		s->pix_fmt = pick_best_format(s->fd, formats_desc, s->requested_vsize, s->fps);
 
 		if (s->pix_fmt == MS_PIX_FMT_UNKNOWN)
@@ -646,15 +849,46 @@ static void msv4l2_do_munmap(V4l2State *s){
 
 
 
+#define MS_V4L2_CONF(required_bitrate, bitrate_limit, resolution, fps, cpus) \
+	{ required_bitrate, bitrate_limit, { MS_VIDEO_SIZE_ ## resolution ## _W, MS_VIDEO_SIZE_ ## resolution ## _H }, fps, cpus, NULL }
+
+static const MSVideoConfiguration v4l2_conf_list[] = {
+	MS_V4L2_CONF(2048000,  5000000,       UXGA, 25, 1),
+	MS_V4L2_CONF(1536000,  2560000, SXGA_MINUS, 25, 1),
+	MS_V4L2_CONF(1024000,  2000000,       720P, 25, 1),
+	MS_V4L2_CONF( 800000,  1536000,        XGA, 25, 1),
+	MS_V4L2_CONF( 750000,  1024000,       SVGA, 25, 1),
+	MS_V4L2_CONF( 600000,  3000000,        VGA, 30, 1),
+	MS_V4L2_CONF( 450000,   600000,        VGA, 25, 1),
+	MS_V4L2_CONF( 350000,   600000,        VGA, 15, 1),
+	MS_V4L2_CONF( 200000,   350000,        CIF, 18, 1),
+	MS_V4L2_CONF( 150000,   200000,       QVGA, 15, 1),
+	MS_V4L2_CONF( 100000,   150000,       QVGA, 10, 1),
+	MS_V4L2_CONF(  64000,   100000,       QCIF, 12, 1),
+	MS_V4L2_CONF(      0,    64000,       QCIF,  5 ,1),
+};
+
 static void msv4l2_init(MSFilter *f){
 	V4l2State *s=ms_new0(V4l2State,1);
 	char* tmp=NULL;
 	
 	s->dev=ms_strdup("/dev/video0");
 	s->fd=-1;
-	s->requested_vsize=MS_VIDEO_SIZE_CIF;
+	s->requested_vsize=MS_VIDEO_SIZE_720P;
 	s->fps=15;
 	s->configured=FALSE;
+	s->pix_fmt = MS_PIX_FMT_UNKNOWN;
+	s->packer = rfc3984_new();
+	s->vconf.required_bitrate = 1024000;
+	s->vconf.bitrate_limit = 1536000;
+	s->vconf.vsize.width = 1280;
+	s->vconf.vsize.height = 720;
+	s->vconf.fps = 15.;
+	s->vconf.mincpu = 1;
+	s->vconf_list = &v4l2_conf_list[0];
+
+	rfc3984_set_mode(s->packer, 1);
+	rfc3984_enable_stap_a(s->packer, FALSE);
 	f->data=s;
 	qinit(&s->rq);
 	
@@ -674,6 +908,7 @@ static void msv4l2_uninit(MSFilter *f){
 	flushq(&s->rq,0);
 	ms_mutex_destroy(&s->mutex);
 	if (s->use_rotation) ms_yuv_buf_allocator_free(s->buf_allocator);
+	rfc3984_destroy(s->packer);
 	ms_free(s);
 }
 
@@ -710,6 +945,7 @@ static void *msv4l2_thread(void *ptr){
 				mblk_t *om=dupmsg(m);
 				mblk_set_marker_info(om,(s->pix_fmt==MS_MJPEG));
 				ms_mutex_lock(&s->mutex);
+				ms_message("msv4l2_thread got an image");
 				putq(&s->rq,om);
 				ms_mutex_unlock(&s->mutex);
 			}
@@ -770,15 +1006,89 @@ static void msv4l2_process(MSFilter *f){
 	if (ms_video_capture_new_frame(&s->framerate_controller, f->ticker->time)){
 		mblk_t *om=NULL;
 		ms_mutex_lock(&s->mutex);
-		/*keep the most recent frame if several frames have been captured */
 		if (s->fd!=-1){
-			mblk_t *tmp=NULL;
-			while((tmp=getq(&s->rq))!=NULL){
-				if (om!=NULL) freemsg(om);
-				om=tmp;
+			if (s->pix_fmt == MS_H264)
+			{
+				om = getq(&s->rq);
+			}
+			else
+			{
+				/*keep the most recent frame if several frames have been captured */
+				mblk_t *tmp=NULL;
+				while((tmp=getq(&s->rq))!=NULL){
+					if (om!=NULL) freemsg(om);
+					om=tmp;
+				}
 			}
 		}
 		ms_mutex_unlock(&s->mutex);
+		if (om!=NULL && s->pix_fmt == MS_H264)
+		{
+			mblk_t *m;
+			MSQueue nals;
+			ms_queue_init(&nals);
+
+			timestamp=f->ticker->time*90;
+			//while (0)
+			{
+				unsigned char *p, *prev;
+				int zeros;
+				bool_t got_start;
+				int offs;
+
+				got_start = FALSE;
+				zeros = 0;
+				offs = 0;
+				prev = NULL;
+				for (p = om->b_cont->b_rptr; p < om->b_cont->b_wptr; p++)
+				{
+					if (got_start)
+					{
+						unsigned char *t = p - 3;
+						ms_message ("%02x %02x %02x %02x %02x %02x %02x nal type %2d at %d",
+								t[0], t[1], t[2], t[3], t[4], t[5], t[6],
+								*p & 0x1f, offs);
+
+						if (prev)
+						{
+							int size = p - prev - zeros;
+							m = allocb (size, 0);
+							memcpy (m->b_wptr, prev, size);
+							m->b_wptr += size;
+							ms_queue_put (&nals, m);
+						}
+						prev = p;
+
+						got_start = FALSE;
+						zeros = 0;
+					}
+					else
+					{
+						if (*p == 0)
+							zeros ++;
+						else if (zeros >= 2 && *p == 0x01)
+							got_start = TRUE;
+						else
+							zeros = 0;
+					}
+
+					offs ++;
+				}
+
+				if (prev)
+				{
+					int size = p - prev - zeros;
+					m = allocb (size, 0);
+					memcpy (m->b_wptr, prev, size);
+					m->b_wptr += size;
+					ms_queue_put (&nals, m);
+				}
+			}
+			rfc3984_pack (s->packer, &nals, f->outputs[0], timestamp);
+
+			freemsg (om);
+			om = NULL;
+		}
 		if (om!=NULL){
 			if (s->use_rotation && s->rotation > 0) {
 				om = msv4l2_rotate_image(s, om);
@@ -810,6 +1120,7 @@ static void msv4l2_postprocess(MSFilter *f){
 static int msv4l2_set_fps(MSFilter *f, void *arg){
 	V4l2State *s=(V4l2State*)f->data;
 	s->fps=*(float*)arg;
+	ms_message("%s set fps %f", __func__, s->fps);
 	ms_video_init_framerate_controller(&s->framerate_controller, s->fps);
 	ms_average_fps_init(&s->avgfps,"V4L2 capture: fps=%f");
 	return 0;
@@ -826,6 +1137,7 @@ static int msv4l2_set_vsize(MSFilter *f, void *arg){
 	} else {
 		s->used_vsize = s->requested_vsize;
 	}
+	ms_message("%s.%d set size %dx%d", __func__, __LINE__, s->requested_vsize.width, s->requested_vsize.height);
 		
 	return 0;
 }
@@ -845,6 +1157,22 @@ static int msv4l2_get_vsize(MSFilter *f, void *arg){
 	V4l2State *s=(V4l2State*)f->data;
 	msv4l2_check_configured(s);
 	*(MSVideoSize*)arg=s->used_vsize;
+	return 0;
+}
+
+static int msv4l2_set_pixfmt(MSFilter *f, void *arg){
+	V4l2State *s=(V4l2State*)f->data;
+	MSPixFmt *fmt = arg;
+
+	if (s->configured && *fmt == s->pix_fmt)
+		return 0;
+	if (s->configured)
+	{
+		ms_error ("already configured with %d. setting  %d\n", s->pix_fmt, *fmt);
+		return -1;
+	}
+	ms_message("Set pixel format %s", ms_pix_fmt_to_string (*fmt));
+	s->pix_fmt = *fmt;
 	return 0;
 }
 
@@ -882,13 +1210,47 @@ static int ms4vl2_set_device_orientation(MSFilter *f, void *arg) {
 	return 0;
 }
 
+static int msv4l2_set_configuration(MSFilter *f, void *data) {
+	V4l2State *s = (V4l2State *)f->data;
+	const MSVideoConfiguration *vconf = (const MSVideoConfiguration *)data;
+	MSVideoSize vsize = s->vconf.vsize;
+
+	if (vconf != &s->vconf) memcpy(&s->vconf, vconf, sizeof(MSVideoConfiguration));
+
+	msv4l2_set_fps (f, &s->vconf.fps);
+	msv4l2_set_vsize (f, &s->vconf.vsize);
+	ms_message("Video configuration set: bitrate=%dbits/s, fps=%f, vsize=%dx%d for encoder [%p]"	, s->vconf.required_bitrate,
+		   s->vconf.fps, s->vconf.vsize.width, s->vconf.vsize.height, f);
+	return 0;
+}
+
+static int msv4l2_get_configuration(MSFilter *f, void *data) {
+	V4l2State *s = (V4l2State *)f->data;
+	MSVideoConfiguration *vconf = (MSVideoConfiguration *)data;
+	memcpy(vconf, &s->vconf, sizeof(MSVideoConfiguration));
+	ms_message("Video configuration get: bitrate=%dbits/s, fps=%f, vsize=%dx%d for encoder [%p]"	, s->vconf.required_bitrate,
+		   s->vconf.fps, s->vconf.vsize.width, s->vconf.vsize.height, f);
+	return 0;
+}
+
+static int msv4l2_get_configuration_list(MSFilter *f, void *data) {
+	V4l2State *s = (V4l2State *)f->data;
+	const MSVideoConfiguration **vconf_list = (const MSVideoConfiguration **)data;
+	*vconf_list = s->vconf_list;
+	return 0;
+}
+
 static MSFilterMethod msv4l2_methods[]={
-	{	MS_FILTER_SET_FPS	,	msv4l2_set_fps	},
-	{	MS_FILTER_SET_VIDEO_SIZE,	msv4l2_set_vsize	},
+	//{	MS_FILTER_SET_FPS	,	msv4l2_set_fps	},
+	//{	MS_FILTER_SET_VIDEO_SIZE,	msv4l2_set_vsize	},
 	{	MS_FILTER_GET_VIDEO_SIZE,	msv4l2_get_vsize	},
+	{	MS_FILTER_SET_PIX_FMT	,	msv4l2_set_pixfmt	},
 	{	MS_FILTER_GET_PIX_FMT	,	msv4l2_get_pixfmt	},
-	{	MS_FILTER_GET_FPS	,	msv4l2_get_fps	},
+	//{	MS_FILTER_GET_FPS	,	msv4l2_get_fps	},
 	{	MS_VIDEO_CAPTURE_SET_DEVICE_ORIENTATION	,	ms4vl2_set_device_orientation},
+	{	MS_VIDEO_ENCODER_GET_CONFIGURATION	,	msv4l2_get_configuration},
+	{	MS_VIDEO_ENCODER_SET_CONFIGURATION	,	msv4l2_set_configuration},
+	{	MS_VIDEO_ENCODER_GET_CONFIGURATION_LIST	,	msv4l2_get_configuration_list},
 	{	0			,	NULL		}
 };
 
@@ -910,8 +1272,11 @@ MSFilterDesc ms_v4l2_desc={
 MS_FILTER_DESC_EXPORT(ms_v4l2_desc)
 
 static MSFilter *msv4l2_create_reader(MSWebCam *obj){
+	ms_message ("%s.%d", __func__, __LINE__);
 	MSFilter *f=ms_factory_create_filter(ms_web_cam_get_factory(obj),MS_V4L2_CAPTURE_ID);
+	ms_message ("%s.%d f %p", __func__, __LINE__, f);
 	msv4l2_set_devfile(f,obj->name);
+	ms_message ("%s.%d", __func__, __LINE__);
 	return f;
 }
 
@@ -920,13 +1285,82 @@ static void msv4l2_detect(MSWebCamManager *obj);
 static void msv4l2_cam_init(MSWebCam *cam){
 }
 
+static bool_t msv4l2_encode_to_mime_type (MSWebCam *obj, const char *mime_type)
+{
+	struct v4l2_capability cap;
+	int fd;
+	int i;
+	bool_t result;
+	uint32_t camera_caps;
+	const char *env;
+
+	if (strcasecmp(mime_type, "H264"))
+		return FALSE;
+
+	env = getenv ("MS2_V4L2_NO_ENCODE");
+	if (env && !strcmp (env, mime_type))
+		return FALSE;
+
+	fd = open (obj->name, O_RDWR);
+	if (fd < 0)
+		return FALSE;
+
+	if (v4l2_ioctl (fd, VIDIOC_QUERYCAP, &cap) < 0)
+	{
+		close (fd);
+		return FALSE;
+	}
+	camera_caps = cap.capabilities;
+#ifdef V4L2_CAP_DEVICE_CAPS
+	if (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+		camera_caps = cap.device_caps;
+#else
+	camera_caps = V4L2_CAP_VIDEO_CAPTURE;
+#endif
+	if (!(camera_caps & V4L2_CAP_VIDEO_CAPTURE))
+	{
+		close (fd);
+		return FALSE;
+	}
+
+	result = FALSE;
+	for (i=0; ; i++)
+	{
+		struct v4l2_fmtdesc fmt;
+		char pixelfmt[5];
+
+		memset (&fmt, 0, sizeof (fmt));
+		fmt.index = i;
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+		if (v4l2_ioctl (fd, VIDIOC_ENUM_FMT, &fmt) < 0)
+			break;
+
+		pixelfmt[0] = (fmt.pixelformat >>  0) & 0xff;
+		pixelfmt[1] = (fmt.pixelformat >>  8) & 0xff;
+		pixelfmt[2] = (fmt.pixelformat >> 16) & 0xff;
+		pixelfmt[3] = (fmt.pixelformat >> 24) & 0xff;
+		pixelfmt[4] = 0;
+
+		if (!strcasecmp(mime_type, pixelfmt))
+		{
+			ms_message ("Okey to encode %s", mime_type);
+			result = TRUE;
+			break;
+		}
+	}
+
+	close (fd);
+	return result;
+}
+
 MSWebCamDesc v4l2_card_desc={
 	"V4L2",
 	&msv4l2_detect,
 	&msv4l2_cam_init,
 	&msv4l2_create_reader,
 	NULL,
-	NULL
+	&msv4l2_encode_to_mime_type,
 };
 
 static void msv4l2_detect(MSWebCamManager *obj){

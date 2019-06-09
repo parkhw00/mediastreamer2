@@ -377,6 +377,7 @@ void video_stream_set_preview_size(VideoStream *stream, MSVideoSize vsize){
 }
 
 void video_stream_set_fps(VideoStream *stream, float fps){
+	ms_message("%s fps %f", __func__, fps);
 	stream->forced_fps=fps;
 }
 
@@ -570,6 +571,7 @@ static void configure_video_source(VideoStream *stream, bool_t skip_bitrate){
 		vconf.fps=pf.fmt->fps;
 		if (vconf.fps==0) vconf.fps=15;
 	}else{
+		ms_message("Setting sent vsize=%ix%i, fps=%f",vconf.vsize.width,vconf.vsize.height,vconf.fps);
 		if (stream->forced_fps!=0)
 			vconf.fps=stream->forced_fps;
 		ms_message("Setting sent vsize=%ix%i, fps=%f",vconf.vsize.width,vconf.vsize.height,vconf.fps);

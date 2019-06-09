@@ -262,7 +262,7 @@ void ms_factory_register_filter(MSFactory* factory, MSFilterDesc* desc ) {
 				|| methods[i].id==MS_VIDEO_ENCODER_SET_CONFIGURATION_LIST
 			) {
 				ms_error("MSFilter %s is using a deprecated method (id=%i)",desc->name,methods[i].id);
-				return;
+				//return;
 			}
 		}
 	}
